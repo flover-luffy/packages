@@ -22,14 +22,26 @@ GO_PKG_BUILD_PKG:=github.com/fatedier/frp/cmd/...
 include $(INCLUDE_DIR)/package.mk
 include ../../lang/golang/golang-package.mk
 
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	mkdir -p $(PKG_BUILD_DIR)/web/frpc/dist
+	mkdir -p $(PKG_BUILD_DIR)/web/frps/dist
+	touch $(PKG_BUILD_DIR)/web/frpc/dist/index.html
+	touch $(PKG_BUILD_DIR)/web/frps/dist/index.html
+endef
+
 define Package/frp/install
 	$(INSTALL_DIR) $(1)/usr/bin/
 	$(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/$(2) $(1)/usr/bin/
+	
 	$(INSTALL_DIR) $(1)/etc/frp/$(2).d/
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/conf/legacy/$(2)_legacy_full.ini $(1)/etc/frp/$(2).d/
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/conf/$(2)_full_example.toml $(1)/etc/frp/$(2).d/
+	if [ -f $(PKG_BUILD_DIR)/conf/$(2)_full_example.toml ]; then \
+		$(INSTALL_DATA) $(PKG_BUILD_DIR)/conf/$(2)_full_example.toml $(1)/etc/frp/$(2).d/; \
+	fi
+	
 	$(INSTALL_DIR) $(1)/etc/config/
 	$(INSTALL_CONF) ./files/$(2).config $(1)/etc/config/$(2)
+	
 	$(INSTALL_DIR) $(1)/etc/init.d/
 	$(INSTALL_BIN) ./files/$(2).init $(1)/etc/init.d/$(2)
 
@@ -65,5 +77,6 @@ endef
 
 $(eval $(call Package/frp/template,frpc,client))
 $(eval $(call Package/frp/template,frps,server))
+
 $(eval $(call BuildPackage,frpc))
 $(eval $(call BuildPackage,frps))
