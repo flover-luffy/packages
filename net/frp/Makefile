@@ -1,12 +1,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=frp
-PKG_VERSION:=0.67.0
+PKG_VERSION:=0.70.1
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/fatedier/frp/tar.gz/v${PKG_VERSION}?
-PKG_HASH:=18d0a35b965fab7e348aafc7b587847dd04ef2ef84822ed8fd5b9fe46b7ff6d7
+PKG_HASH:=67246606f504cb15df72193f1a83911259e92b6a87838cff8850031efd406dc8
 
 PKG_MAINTAINER:=
 PKG_LICENSE:=Apache-2.0
@@ -18,17 +18,14 @@ PKG_BUILD_FLAGS:=no-mips16
 
 GO_PKG:=github.com/fatedier/frp
 GO_PKG_BUILD_PKG:=github.com/fatedier/frp/cmd/...
+# Upstream provides the "noweb" build tag (web/frp{c,s}/embed_stub.go) to skip
+# embedding the Vue dashboard. This avoids the node/host build dependency and
+# replaces the previous hack of creating empty web/frp{c,s}/dist/index.html.
+GO_PKG_TAGS:=noweb
+GO_PKG_LDFLAGS_X:=github.com/fatedier/frp/pkg/util/version.version=$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 include ../../lang/golang/golang-package.mk
-
-define Build/Prepare
-	$(call Build/Prepare/Default)
-	mkdir -p $(PKG_BUILD_DIR)/web/frpc/dist
-	mkdir -p $(PKG_BUILD_DIR)/web/frps/dist
-	touch $(PKG_BUILD_DIR)/web/frpc/dist/index.html
-	touch $(PKG_BUILD_DIR)/web/frps/dist/index.html
-endef
 
 define Package/frp/install
 	$(INSTALL_DIR) $(1)/usr/bin/
