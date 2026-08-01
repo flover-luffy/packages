@@ -5,12 +5,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sing-box
-PKG_VERSION:=1.12.25
+PKG_VERSION:=1.13.15
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/SagerNet/sing-box/tar.gz/v$(PKG_VERSION)?
-PKG_HASH:=881435f07b5ab8170ccf3cb69e87130759521dc0ed1ae4bfeacbe7772a93a158
+PKG_HASH:=b43456c0cb2d4d7b81664010b2149a35ed6e3f6c245d78bcc7caf27c46eca816
 
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_LICENSE_FILES:=LICENSE
@@ -21,7 +21,6 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_SING_BOX_TINY_BUILD_ACME \
 	CONFIG_SING_BOX_TINY_BUILD_CLASH_API \
 	CONFIG_SING_BOX_TINY_BUILD_DHCP \
-	CONFIG_SING_BOX_TINY_BUILD_EMBEDDED_TOR \
 	CONFIG_SING_BOX_TINY_BUILD_GRPC \
 	CONFIG_SING_BOX_TINY_BUILD_GVISOR \
 	CONFIG_SING_BOX_TINY_BUILD_QUIC \
@@ -92,10 +91,6 @@ define Package/sing-box-tiny/config
     config SING_BOX_TINY_BUILD_DHCP
     bool "Build with DHCP support"
 
-    config SING_BOX_TINY_BUILD_EMBEDDED_TOR
-    bool "Build with embedded Tor support"
-    depends on BROKEN
-
     config SING_BOX_TINY_BUILD_GRPC
     bool "Build with standard gPRC support"
     help
@@ -135,7 +130,6 @@ else
 	$(if $(CONFIG_SING_BOX_TINY_BUILD_ACME),with_acme) \
 	$(if $(CONFIG_SING_BOX_TINY_BUILD_CLASH_API),with_clash_api) \
 	$(if $(CONFIG_SING_BOX_TINY_BUILD_DHCP),with_dhcp) \
-	$(if $(CONFIG_SING_BOX_TINY_BUILD_EMBEDDED_TOR),with_embedded_tor) \
 	$(if $(CONFIG_SING_BOX_TINY_BUILD_GRPC),with_grpc) \
 	$(if $(CONFIG_SING_BOX_TINY_BUILD_GVISOR),with_gvisor) \
 	$(if $(CONFIG_SING_BOX_TINY_BUILD_QUIC),with_quic) \
