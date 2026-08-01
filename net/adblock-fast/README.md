@@ -1,11 +1,11 @@
 # adblock-fast
 
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-Compatible-blueviolet)](https://openwrt.org)
-[![Web UI](https://img.shields.io/badge/Web_UI-Available-blue)](https://docs.openwrt.melmac.ca/adblock-fast/)
+[![Web UI](https://img.shields.io/badge/Web_UI-Available-blue)](https://docs.mossdef.org/adblock-fast/)
 [![Lightweight](https://img.shields.io/badge/Size-Lightweight-brightgreen)](https://openwrt.org/packages/pkgdata/adblock-fast)
 [![License](https://img.shields.io/badge/License-AGPL--3.0--or--later-lightgrey)](https://github.com/stangri/adblock-fast/blob/master/LICENSE)
 
-A fast, lightweight DNS-based ad-blocker for OpenWrt that works with dnsmasq, smartdns, or unbound.  
+A fast, lightweight DNS-based ad-blocker for OpenWrt that works with dnsmasq, smartdns, unbound, or BIND.  
 It runs once to process and install blocklists, then exits — keeping memory usage low.
 
 ## Features
@@ -17,4 +17,4 @@ It runs once to process and install blocklists, then exits — keeping memory us
 - Reverts if DNS resolution fails after restart
 
 📚 **Full documentation:**  
-[https://docs.openwrt.melmac.ca/adblock-fast/](https://docs.openwrt.melmac.ca/adblock-fast/)
+[https://docs.mossdef.org/adblock-fast/](https://docs.mossdef.org/adblock-fast/)

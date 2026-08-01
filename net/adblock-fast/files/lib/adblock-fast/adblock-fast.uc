@@ -5,7 +5,7 @@
 // Main ucode module for adblock-fast.
 // All business logic lives here; the init script is a thin procd wrapper.
 
-import { readfile, writefile, popen, stat, unlink, rename, open, glob, mkdir, mkstemp, symlink, chmod, chown, realpath, lsdir, access, dirname } from 'fs';
+import { readfile, writefile, popen, stat, unlink, rename, open, glob, mkdir, symlink, chmod, chown, realpath, lsdir, access, dirname } from 'fs';
 import { cursor } from 'uci';
 import { connect } from 'ubus';
 import * as uloop from 'uloop';
@@ -15,13 +15,17 @@ import * as uloop from 'uloop';
 const pkg = {
 	name: 'adblock-fast',
 	version: 'dev-test',
-	compat: '14',
+	compat: '18',
 	memory_threshold: 33554432,
+	// Per parallel-download task slot: ucode task child (~1 MB) + the
+	// downloader's RSS. Measured: curl ~2.8 MB, uclient-fetch ~2.5 MB,
+	// GNU wget ~8.5 MB. Conservative round-ups, in bytes.
+	task_slot_ram: { curl: 4194304, 'uclient-fetch': 4194304, wget: 10485760, 'default': 10485760 },
 	config_file: '/etc/config/adblock-fast',
 	dnsmasq_file: '/var/run/adblock-fast/adblock-fast.dnsmasq',
 	run_file: '/dev/shm/adblock-fast',
 	triggers: {
-		reload: 'parallel_downloads debug download_timeout allowed_domain blocked_domain allowed_url blocked_url dns config_update_enabled config_update_url dnsmasq_config_file_url curl_additional_param curl_max_file_size curl_retry',
+		reload: 'parallel_downloads debug download_timeout download_connect_timeout download_max_time download_allow_insecure allowed_domain blocked_domain allowed_url blocked_url dns config_update_enabled config_update_url dnsmasq_config_file_url curl_additional_param curl_max_file_size curl_retry',
 		restart: 'compressed_cache compressed_cache_dir force_dns led force_dns_port',
 	},
 };
@@ -104,6 +108,23 @@ const dns_modes = {
 		format_filter: 's|^|local-zone: "|;s|$|." always_nxdomain|',
 		parse_filter: 's|^local-zone: "||;s|." always_nxdomain$||;',
 	},
+	'bind.rpz': {
+		file: '/var/run/' + pkg.name + '/rpz.' + pkg.name + '.zone',
+		cache: '/var/run/' + pkg.name + '/bind.rpz.cache',
+		gzip: pkg.name + '.bind.rpz.gz',
+		config: '/var/run/' + pkg.name + '/bind.rpz.conf',
+		// Each blocked domain becomes an apex + wildcard RPZ record so both the
+		// name itself and all its subdomains resolve to NXDOMAIN ("CNAME .").
+		// The SOA/NS zone header (with a per-run serial) is prepended after
+		// formatting — see download_lists().
+		format_filter: 's|^\\(.*\\)$|\\1 CNAME .\\n*.\\1 CNAME .|',
+		// Reverse for show/parse: drop the zone header and wildcard duplicates,
+		// strip the record suffix, leaving one bare domain per blocked entry.
+		parse_filter: '/^[$@]/d;/^[[:space:]]*IN /d;/^\\*\\./d;s| CNAME .$||;',
+		// Count only the apex records (one per domain) so the blocked count is
+		// not doubled by wildcards nor inflated by the header lines.
+		blocked_count_filter: '/^\\*\\./d;/ CNAME \\.$/!d',
+	},
 };
 
 const tmp = {
@@ -170,6 +191,7 @@ let env = {
 	dnsmasq_features: '',
 	smartdns_installed: false,
 	unbound_installed: false,
+	bind_installed: false,
 	ipset_supported: false,
 	nft_installed: false,
 	awk_cmd: 'awk',
@@ -179,6 +201,9 @@ let env = {
 
 	// Downloader (set lazily by env.get_downloader())
 	_dl_cache: null,
+	// Set by download(): true when the last transfer was aborted by a timeout
+	// (only curl reports this distinctly — see download()).
+	_last_dl_timeout: false,
 
 	// Guard flags
 	_detected: false,
@@ -199,6 +224,17 @@ let dns_output = {
 
 // Config values loaded by env.load_config()
 let cfg = {};
+
+// RAM mirror of UCI config for sizes (used when update_config_sizes is false)
+function ram_uci(name) {
+	let confdir = '/var/run/' + name + '/uci';
+	let mirror = confdir + '/' + name;
+	if (!stat(mirror)) {
+		system('mkdir -p ' + confdir);
+		writefile(mirror, readfile('/etc/config/' + name) || '');
+	}
+	return cursor(confdir);
+}
 
 // ── Shell / System Helpers ──────────────────────────────────────────
 
@@ -295,6 +331,9 @@ env.detect = function() {
 	env.dnsmasq_installed = is_present('dnsmasq');
 	env.smartdns_installed = is_present('smartdns');
 	env.unbound_installed = is_present('unbound');
+	// BIND ships its daemon as `named`; the RPZ zone tools share that prefix
+	// (named-checkzone / named-checkconf) and the OpenWrt init script is `named`.
+	env.bind_installed = is_present('named');
 	env.nft_installed = is_present('nft');
 	env.ipset_supported = is_present('ipset') && cmd_rc('/usr/sbin/ipset help hash:net') == 0;
 	if (is_present('gawk')) env.awk_cmd = 'gawk';
@@ -308,30 +347,68 @@ env.detect = function() {
 
 env.get_downloader = function() {
 	if (env._dl_cache) return env._dl_cache;
-	let command, flag, ssl_supported;
+	let command, flag, ssl_supported, kind;
+	// Preference: curl, then uclient-fetch (both ~2.5-2.8 MB RSS); GNU wget
+	// is last — it is ~8.5 MB RSS, ~3x heavier, costly when run in parallel.
+	// Timeout semantics differ per downloader (see README support matrix):
+	//   download_connect_timeout → connection phase only (curl/GNU wget).
+	//   download_timeout → abort a stalled transfer: curl has no read-timeout,
+	//     so emulate it with --speed-limit 1 --speed-time (abort if avg speed
+	//     stays below 1 B/s for that many seconds); GNU wget uses --read-timeout;
+	//     uclient-fetch / BusyBox wget only have --timeout (inactivity-based).
+	//   download_max_time → hard cap on the whole transfer; generically named
+	//     so any downloader can adopt it, though only curl (--max-time)
+	//     implements it today.
 	if (is_present('curl')) {
-		command = 'curl -f --silent --insecure';
-		if (cfg.curl_additional_param) command += ' ' + shell_quote(cfg.curl_additional_param);
+		kind = 'curl';
+		command = 'curl -f --silent';
+		if (cfg.download_allow_insecure) command += ' --insecure';
+		if (cfg.curl_additional_param) command += ' ' + cfg.curl_additional_param;
 		if (cfg.curl_max_file_size) command += ' --max-filesize ' + cfg.curl_max_file_size;
 		if (cfg.curl_retry) command += ' --retry ' + cfg.curl_retry;
-		if (cfg.download_timeout) command += ' --connect-timeout ' + cfg.download_timeout;
+		if (cfg.download_connect_timeout) command += ' --connect-timeout ' + cfg.download_connect_timeout;
+		if (cfg.download_timeout) command += ' --speed-limit 1 --speed-time ' + cfg.download_timeout;
+		if (cfg.download_max_time) command += ' --max-time ' + cfg.download_max_time;
 		flag = '-o';
-	} else if (is_present('/usr/libexec/wget-ssl')) {
-		command = '/usr/libexec/wget-ssl --no-check-certificate -q';
+	} else if (is_present('uclient-fetch')) {
+		kind = 'uclient-fetch';
+		command = 'uclient-fetch -q';
+		if (cfg.download_allow_insecure) command += ' --no-check-certificate';
 		if (cfg.download_timeout) command += ' --timeout ' + cfg.download_timeout;
+		flag = '-O';
+	} else if (is_present('/usr/libexec/wget-ssl')) {
+		kind = 'wget';
+		command = '/usr/libexec/wget-ssl -q';
+		if (cfg.download_allow_insecure) command += ' --no-check-certificate';
+		if (cfg.download_connect_timeout) command += ' --connect-timeout ' + cfg.download_connect_timeout;
+		if (cfg.download_timeout) command += ' --read-timeout ' + cfg.download_timeout;
 		flag = '-O';
 	} else if (is_present('wget') && cmd_rc("wget --version 2>/dev/null | grep -q '+https'") == 0) {
-		command = 'wget --no-check-certificate -q';
-		if (cfg.download_timeout) command += ' --timeout ' + cfg.download_timeout;
+		kind = 'wget';
+		command = 'wget -q';
+		if (cfg.download_allow_insecure) command += ' --no-check-certificate';
+		if (cfg.download_connect_timeout) command += ' --connect-timeout ' + cfg.download_connect_timeout;
+		if (cfg.download_timeout) command += ' --read-timeout ' + cfg.download_timeout;
 		flag = '-O';
 	} else {
-		command = 'uclient-fetch --no-check-certificate -q';
+		// Last-ditch: nothing detected — use the /usr/bin/wget ALTERNATIVES
+		// alias (GNU wget or uclient-fetch), the downloader name most likely
+		// to exist on any OpenWrt system. Only --timeout is portable across
+		// BusyBox wget / uclient-fetch, so download_connect_timeout is omitted here.
+		kind = 'wget';
+		command = 'wget -q';
+		if (cfg.download_allow_insecure) command += ' --no-check-certificate';
 		if (cfg.download_timeout) command += ' --timeout ' + cfg.download_timeout;
 		flag = '-O';
 	}
+	// uclient-fetch is built with TLS support but loads it at runtime from a
+	// libustream-ssl provider — so its HTTPS capability is gated on that .so,
+	// which curl/wget --version greps cannot see.
 	ssl_supported = cmd_rc("curl --version 2>/dev/null | grep -q 'Protocols: .*https.*'") == 0 ||
-		cmd_rc("wget --version 2>/dev/null | grep -q '+ssl'") == 0;
-	env._dl_cache = { command, flag, ssl_supported };
+		cmd_rc("wget --version 2>/dev/null | grep -q '+ssl'") == 0 ||
+		stat('/lib/libustream-ssl.so') != null ||
+		stat('/usr/lib/libustream-ssl.so') != null;
+	env._dl_cache = { command, flag, ssl_supported, kind };
 	return env._dl_cache;
 };
 
@@ -377,6 +454,16 @@ function grep_test(pattern, file, flags) {
 		flags || '-q', shell_quote(pattern), shell_quote(file))) == 0;
 }
 
+// The TLD sanity checks flag block-list lines that have no dot (a bare TLD
+// would blackhole an entire suffix). Some resolver headers legitimately have
+// no dot — unbound's `server:` and BIND's `$TTL` line — and must be excluded.
+// Returned as an ERE alternation for use with grep -vE.
+function tld_ok_pattern() {
+	return cfg.dns == 'bind.rpz'
+		? '\\.|server:|^[$@]|^[[:space:]]*IN '
+		: '\\.|server:';
+}
+
 function grep_count(pattern, file, flags) {
 	return int(trim(cmd_output(sprintf('grep %s %s %s',
 		flags || '-c', shell_quote(pattern), shell_quote(file)))) || '0');
@@ -411,8 +498,15 @@ function awk_dedup_subdomains(input, output) {
 
 function download(url, dest) {
 	let dlt = env.get_downloader();
-	return system(sprintf('%s %s %s %s 2>/dev/null',
-		dlt.command, shell_quote(url), dlt.flag, shell_quote(dest))) == 0;
+	let rc = system(sprintf('%s %s %s %s 2>/dev/null',
+		dlt.command, shell_quote(url), dlt.flag, shell_quote(dest)));
+	// curl exits 28 for ANY timeout (--connect-timeout / --speed-time /
+	// --max-time). No other downloader exposes a distinct timeout exit code —
+	// a wget/uclient-fetch stall collapses into a generic network-failure code
+	// indistinguishable from DNS/refused/reset — so a timeout-aborted transfer
+	// is only reliably separable from other failures when curl is in use.
+	env._last_dl_timeout = (dlt.kind == 'curl' && rc == 28);
+	return rc == 0;
 }
 
 function service_restart(name) {
@@ -509,6 +603,7 @@ let output = {
 		if (index(d, 'dnsmasq.') == 0) _write(2, '[DNSM] ' + msg);
 		else if (index(d, 'smartdns.') == 0) _write(2, '[SMRT] ' + msg);
 		else if (index(d, 'unbound.') == 0) _write(2, '[UNBD] ' + msg);
+		else if (index(d, 'bind.') == 0) _write(2, '[BIND] ' + msg);
 	},
 	error:   function(msg) { _write(null, sym.ERR + ' ' + msg + '!\\n'); },
 	warning: function(msg) { _write(null, sym.WARN + ' ' + msg + '!\\n'); },
@@ -629,7 +724,7 @@ function get_text(r, ...args) {
 	case 'errorParsingList': return "Failed to parse";
 	case 'errorNoSSLSupport': return "No HTTPS/SSL support on device";
 	case 'errorCreatingDirectory': return "Failed to create output/cache/gzip file directory";
-	case 'errorDetectingFileType': return "Failed to detect format";
+	case 'errorDetectingFileType': return sprintf("Failed to detect format for %s", a);
 	case 'errorNothingToDo': return "No blocked list URLs nor blocked-domains enabled";
 	case 'errorTooLittleRam': return sprintf("Free ram (%s) is not enough to process all enabled block-lists", a);
 	case 'errorCreatingBackupFile': return sprintf("Failed to create backup file %s", a);
@@ -649,9 +744,12 @@ function get_text(r, ...args) {
 	case 'statusTriggerBootWait': return "waiting for trigger (on_boot)";
 	case 'statusTriggerStartWait': return "waiting for trigger (on_start)";
 	case 'warningExternalDnsmasqConfig': return "Use of external dnsmasq config file detected, please set 'dns' option to 'dnsmasq.conf'";
-	case 'warningMissingRecommendedPackages': return "Some recommended packages are missing";
+	case 'warningBindManualConfig': return sprintf("BIND RPZ zone written; ensure named.conf includes '%s' and adds 'response-policy { zone \"rpz.%s\"; };' to its options{} (one-time setup)", a, pkg.name);
+	case 'warningMissingRecommendedPackages': return sprintf("Recommended packages are missing: %s", a);
 	case 'warningInvalidCompressedCacheDir': return sprintf("Invalid compressed cache directory '%s'", a);
 	case 'warningFreeRamCheckFail': return "Can't detect free RAM";
+	case 'warningParallelDownloadsThrottled': return sprintf("Parallel downloads reduced to %s due to low free memory", a);
+	case 'warningDownloadTimeout': return sprintf("Download of %s timed out; the server may be too slow — consider increasing download_timeout, download_connect_timeout or download_max_time", a);
 	case 'warningSanityCheckTLD': return sprintf("Sanity check discovered TLDs in %s", a);
 	case 'warningSanityCheckLeadingDot': return sprintf("Sanity check discovered leading dots in %s", a);
 	case 'warningInvalidDomainsRemoved': return sprintf("Removed %s invalid domain entries from block-list (domains starting with -/./numbers or containing invalid patterns)", a);
@@ -664,6 +762,7 @@ function get_text(r, ...args) {
 env.check_dnsmasq = function() { env.detect(); return env.dnsmasq_installed; };
 env.check_smartdns = function() { env.detect(); return env.smartdns_installed; };
 env.check_unbound = function() { env.detect(); return env.unbound_installed; };
+env.check_bind = function() { env.detect(); return env.bind_installed; };
 env.check_ipset = function() { env.detect(); return env.ipset_supported; };
 env.check_nft = function() { env.detect(); return env.nft_installed; };
 
@@ -727,10 +826,12 @@ function get_url_filesize(url) { // ucode-lsp disable
 	if (!url) return null;
 	let size = '';
 	if (is_present('curl')) {
-		size = cmd_output(sprintf("curl --silent --insecure --fail --head --request GET --connect-timeout 2 %s | awk -F': ' '{IGNORECASE=1}/content-length/ {gsub(/\\r/, \"\"); print $2}'", shell_quote(url)));
+		let insecure = cfg.download_allow_insecure ? '--insecure ' : '';
+		size = cmd_output(sprintf("curl --silent %s--fail --head --request GET --connect-timeout 2 %s | awk -F': ' '{IGNORECASE=1}/content-length/ {gsub(/\\r/, \"\"); print $2}'", insecure, shell_quote(url)));
 	}
 	if (!size && is_present('uclient-fetch')) {
-		size = cmd_output(sprintf("uclient-fetch --spider --timeout 2 %s -O /dev/null 2>&1 | sed -n '/^Download/ s/.*\\(\\([0-9]*\\) bytes\\).*/\\1/p'", shell_quote(url)));
+		let insecure = cfg.download_allow_insecure ? '--no-check-certificate ' : '';
+		size = cmd_output(sprintf("uclient-fetch --spider %s--timeout 2 %s -O /dev/null 2>&1 | sed -n '/^Download/ s/.*\\(\\([0-9]*\\) bytes\\).*/\\1/p'", insecure, shell_quote(url)));
 	}
 	return size ? size : null;
 }
@@ -828,10 +929,11 @@ const config_schema = { // ucode-lsp disable
 	debug_performance:       ['bool', false],
 	dnsmasq_sanity_check:    ['bool', true],
 	dnsmasq_validity_check:  ['bool', false],
+	download_allow_insecure: ['bool', true],
 	enabled:                 ['bool', false],
 	force_dns:               ['bool', true],
 	ipv6_enabled:            ['bool', false],
-	parallel_downloads:      ['bool', true],
+	parallel_downloads:      ['int', 8],
 	procd_trigger_wan6:      ['bool', false],
 	update_config_sizes:     ['bool', true],
 	// Strings
@@ -841,7 +943,10 @@ const config_schema = { // ucode-lsp disable
 	curl_retry:              ['string', '3'],
 	dns:                     ['string', 'dnsmasq.servers'],
 	dnsmasq_config_file_url: ['string'],
+	download_connect_timeout: ['string', '10'],
+	download_max_time:       ['string'],
 	download_timeout:        ['string', '20'],
+	gateway_check:           ['string', 'netifd'],
 	heartbeat_sleep_timeout: ['string', '10'],
 	led:                     ['string'],
 	pause_timeout:           ['string', '20'],
@@ -857,7 +962,7 @@ const config_schema = { // ucode-lsp disable
 	force_dns_port:          ['list', '53 853'],
 	smartdns_instance:       ['list', '*'],
 	// Domain (sanitized, '-' means disabled)
-	heartbeat_domain:        ['domain', 'heartbeat.melmac.ca'],
+	heartbeat_domain:        ['domain', 'heartbeat.mossdef.org'],
 	// Directory (validated via realpath)
 	compressed_cache_dir:    ['dir', '/etc'],
 };
@@ -913,7 +1018,12 @@ function load_dl_command() { env.get_downloader(); }
 // ── detect_file_type ────────────────────────────────────────────────
 
 function detect_file_type(file) {
-	let first_line = split(readfile(file) || '', '\n')[0];
+	let first_line = '';
+	let fh = open(file, 'r');
+	if (fh) {
+		first_line = split(fh.read(4096) || '', '\n')[0];
+		fh.close();
+	}
 	for (let name in keys(list_formats)) {
 		let fmt = list_formats[name];
 		if (fmt.first_line && first_line == fmt.first_line) return name;
@@ -1017,9 +1127,12 @@ env.load = function(param, validation_result) {
 
 	let _check_resolver_environment = function() {
 		// Check resolver presence
-		let dns_family = split(cfg.dns, '.')[0];
-		switch (dns_family) {
-		case 'dnsmasq':
+		switch (cfg.dns) {
+		case 'dnsmasq.addnhosts':
+		case 'dnsmasq.conf':
+		case 'dnsmasq.ipset':
+		case 'dnsmasq.nftset':
+		case 'dnsmasq.servers':
 			if (!env.check_dnsmasq()) {
 				if (param != 'quiet') {
 					push(status_data.errors, { code: 'errorDNSReload', info: '' });
@@ -1029,7 +1142,9 @@ env.load = function(param, validation_result) {
 			}
 			if (env.check_dnsmasq_feature('idn')) cfg.allow_non_ascii = false;
 			break;
-		case 'smartdns':
+		case 'smartdns.domainset':
+		case 'smartdns.ipset':
+		case 'smartdns.nftset':
 			if (!env.check_smartdns()) {
 				if (param != 'quiet') {
 					push(status_data.errors, { code: 'errorDNSReload', info: '' });
@@ -1039,7 +1154,7 @@ env.load = function(param, validation_result) {
 			}
 			cfg.allow_non_ascii = false;
 			break;
-		case 'unbound':
+		case 'unbound.adb_list':
 			if (!env.check_unbound()) {
 				if (param != 'quiet') {
 					push(status_data.errors, { code: 'errorDNSReload', info: '' });
@@ -1048,6 +1163,18 @@ env.load = function(param, validation_result) {
 				return false;
 			}
 			cfg.allow_non_ascii = true;
+			break;
+		case 'bind.rpz':
+			if (!env.check_bind()) {
+				if (param != 'quiet') {
+					push(status_data.errors, { code: 'errorDNSReload', info: '' });
+					output.error("Resolver 'bind' (named) not found");
+				}
+				return false;
+			}
+			// RPZ zone owner names must be plain ASCII/punycode for the zone to
+			// load, so non-ASCII labels are filtered out (unlike unbound).
+			cfg.allow_non_ascii = false;
 			break;
 		}
 
@@ -1134,17 +1261,22 @@ env.load = function(param, validation_result) {
 		let missing = [];
 		for (let key in bins) {
 			if (!is_present(bins[key][0])) {
-				push(status_data.warnings, { code: 'warningMissingRecommendedPackages', info: bins[key][1] });
 				push(missing, bins[key][1]);
 			}
 		}
+		if (length(missing))
+			push(status_data.warnings, { code: 'warningMissingRecommendedPackages', info: join(', ', missing) });
+
 		if (length(missing) && param != 'quiet') {
-			output.warning(get_text('warningMissingRecommendedPackages') + ', install them by running:');
-			output.print('opkg update; opkg --force-overwrite install ' + join(' ', missing) + ';');
+			output.warning(get_text('warningMissingRecommendedPackages', join(', ', missing)) + '; install them by running:');
+			if (is_present('apk'))
+				output.print('apk update; apk add ' + join(' ', missing) + ';');
+			else
+				output.print('opkg update; opkg --force-overwrite install ' + join(' ', missing) + ';');
 		}
 	};
 
-	let _check_wan_gateway = function() {
+	let _check_netifd_gateway = function() {
 		let ub = connect();
 		if (!ub) return false;
 		let dump = ub.call('network.interface', 'dump');
@@ -1152,9 +1284,25 @@ env.load = function(param, validation_result) {
 		if (!dump?.interface) return false;
 		for (let iface in dump.interface) {
 			for (let r in (iface.route || []))
-				if (r.target == '0.0.0.0') return true;
+				if (r.target == '0.0.0.0' || r.target == '::') return true;
 		}
 		return false;
+	};
+
+	let _check_kernel_gateway = function() {
+		return system("(ip -4 route show default 2>/dev/null || ip -6 route show default 2>/dev/null) | grep -q .") == 0;
+	};
+
+	let _check_wan_gateway = function() {
+		switch (cfg.gateway_check) {
+		case 'none':
+			return true;
+		case 'kernel':
+			return _check_kernel_gateway();
+		case 'netifd':
+		default:
+			return _check_netifd_gateway();
+		}
 	};
 
 	// ── param-driven branches ───────────────────────────────────────
@@ -1373,8 +1521,63 @@ function _get_smartdns_instances() {
 	return result;
 }
 
+// True when the configured output is one of the dnsmasq modes (the only ones
+// subject to the dnsmasq-specific validity check and file ownership).
+function is_dnsmasq_mode() {
+	switch (cfg.dns) {
+	case 'dnsmasq.addnhosts':
+	case 'dnsmasq.conf':
+	case 'dnsmasq.ipset':
+	case 'dnsmasq.nftset':
+	case 'dnsmasq.servers':
+		return true;
+	}
+	return false;
+}
+
+// The init-script / daemon name for the configured resolver. Usually the
+// cfg.dns prefix, except BIND whose daemon and OpenWrt init script are both
+// `named` (the `bind` token matches the RPZ terminology users search for).
+function resolver_service_name() {
+	switch (cfg.dns) {
+	case 'dnsmasq.addnhosts':
+	case 'dnsmasq.conf':
+	case 'dnsmasq.ipset':
+	case 'dnsmasq.nftset':
+	case 'dnsmasq.servers':
+		return 'dnsmasq';
+	case 'smartdns.domainset':
+	case 'smartdns.ipset':
+	case 'smartdns.nftset':
+		return 'smartdns';
+	case 'unbound.adb_list':
+		return 'unbound';
+	case 'bind.rpz':
+		return 'named';
+	}
+	return split(cfg.dns, '.')[0];
+}
+
+// True when named.conf already wires up our RPZ zone (so the one-time setup
+// note can be suppressed). `named-checkconf -p` expands every include file and
+// prints the effective config, so a zone/response-policy pulled in from an
+// included snippet is still seen; if it is unavailable or the config does not
+// parse, fall back to a literal grep of the main named.conf.
+function _bind_rpz_configured() {
+	let zone = 'rpz.' + pkg.name;
+	if (is_present('named-checkconf')) {
+		let dump = cmd_output('named-checkconf -p 2>/dev/null');
+		if (dump)
+			return index(dump, 'zone "' + zone + '"') >= 0 &&
+			       index(dump, 'response-policy') >= 0;
+	}
+	let content = readfile('/etc/bind/named.conf') || '';
+	return index(content, dns_output.config) >= 0 &&
+	       index(content, 'response-policy') >= 0;
+}
+
 function resolver(action) {
-	let resolver_name = split(cfg.dns, '.')[0];
+	let resolver_name = resolver_service_name();
 	if (!action) return true;
 
 	switch (action) {
@@ -1432,14 +1635,38 @@ function resolver(action) {
 			}
 			output.fail();
 			return false;
+		case 'bind.rpz':
+			output.dns('Testing ' + cfg.dns + ' configuration ');
+			if (cmd_rc(sprintf('named-checkzone -q %s %s',
+				shell_quote('rpz.' + pkg.name), shell_quote(dns_output.file))) == 0) {
+				output.ok();
+				return true;
+			}
+			output.fail();
+			return false;
 		default:
 			return true;
 		}
 
 	case 'restart':
-		output.dns('Restarting ' + resolver_name + ' ');
-		status_data.message = 'Restarting ' + resolver_name;
-		if (service_restart(resolver_name)) {
+		let restarted;
+		if (cfg.dns == 'bind.rpz' && is_present('rndc')) {
+			// BIND: reload just the RPZ zone via rndc — no full daemon bounce and no
+			// resolver cache flush. `rndc reload <zone>` also loads a zone that failed
+			// at named startup because its file was still missing (e.g. the tmpfs zone
+			// file not yet regenerated after a reboot), which is precisely our case.
+			status_data.message = 'Reloading RPZ zone';
+			output.dns(status_data.message + ' ');
+			restarted = cmd_rc(sprintf('rndc reload %s', shell_quote('rpz.' + pkg.name))) == 0;
+			// Fall back to a full restart if the reload failed (rndc not configured,
+			// or the zone stanza is not in named.conf yet).
+			if (!restarted) restarted = service_restart(resolver_name);
+		} else {
+			status_data.message = 'Restarting ' + resolver_name;
+			output.dns(status_data.message + ' ');
+			restarted = service_restart(resolver_name);
+		}
+		if (restarted) {
 			status_data.status = 'statusSuccess';
 			led_on(cfg.led);
 			output.ok();
@@ -1453,7 +1680,7 @@ function resolver(action) {
 	case 'sanity':
 		if (!cfg.dnsmasq_sanity_check) return true;
 		output.dns('Sanity check for ' + cfg.dns + ' TLDs ');
-		if (!grep_test('\\.|server:', dns_output.file, '-qvE')) {
+		if (!grep_test(tld_ok_pattern(), dns_output.file, '-qvE')) {
 			output.ok();
 		} else {
 			push(status_data.warnings, { code: 'warningSanityCheckTLD', info: dns_output.file });
@@ -1461,10 +1688,19 @@ function resolver(action) {
 		}
 		output.dns('Sanity check for ' + cfg.dns + ' leading dots ');
 		let dot_pattern;
-		switch (split(cfg.dns, '.')[0]) {
-		case 'dnsmasq': dot_pattern = '/\\.'; break;
-		case 'smartdns': dot_pattern = '^\\.'; break;
-		case 'unbound': dot_pattern = '"\\.'; break;
+		switch (cfg.dns) {
+		case 'dnsmasq.addnhosts':
+		case 'dnsmasq.conf':
+		case 'dnsmasq.ipset':
+		case 'dnsmasq.nftset':
+		case 'dnsmasq.servers': dot_pattern = '/\\.'; break;
+		case 'smartdns.domainset':
+		case 'smartdns.ipset':
+		case 'smartdns.nftset': dot_pattern = '^\\.'; break;
+		case 'unbound.adb_list': dot_pattern = '"\\.'; break;
+		// RPZ owner names are bare; a legit wildcard starts with '*.', so only a
+		// literal leading dot signals a malformed entry.
+		case 'bind.rpz': dot_pattern = '^\\.'; break;
 		}
 		if (dot_pattern && !grep_test(dot_pattern, dns_output.file)) {
 			output.ok();
@@ -1511,8 +1747,12 @@ function resolver(action) {
 
 	case 'update_config':
 		output.dns('Updating ' + resolver_name + ' configuration ');
-		switch (split(cfg.dns, '.')[0]) {
-		case 'dnsmasq':
+		switch (cfg.dns) {
+		case 'dnsmasq.addnhosts':
+		case 'dnsmasq.conf':
+		case 'dnsmasq.ipset':
+		case 'dnsmasq.nftset':
+		case 'dnsmasq.servers':
 			for (let name in _get_dnsmasq_instances()) {
 				_dnsmasq_instance_config(name, cfg.dns);
 				_dnsmasq_instance_append_force_dns_port(name);
@@ -1527,7 +1767,9 @@ function resolver(action) {
 				return false;
 			}
 			break;
-		case 'smartdns':
+		case 'smartdns.domainset':
+		case 'smartdns.ipset':
+		case 'smartdns.nftset':
 			for (let name in _get_smartdns_instances()) {
 				_smartdns_instance_config(name, cfg.dns);
 				_smartdns_instance_append_force_dns_port(name);
@@ -1538,12 +1780,35 @@ function resolver(action) {
 			chown(dns_output.file, 'root', 'root');
 			chown(dns_output.config, 'root', 'root');
 			break;
-		case 'unbound':
+		case 'unbound.adb_list':
 			let ubnd_cur = cursor();
 			ubnd_cur.load('unbound');
 			ubnd_cur.foreach('unbound', 'unbound', (s) => _unbound_instance_append_force_dns_port(s['.name']));
 			chmod(dns_output.file, 0660);
 			chown(dns_output.file, 'root', 'unbound');
+			break;
+		case 'bind.rpz':
+			// BIND on OpenWrt has no UCI config model, so we cannot splice the
+			// required stanzas into named.conf the way the dnsmasq/smartdns/unbound
+			// instances are wired. Instead emit a ready-to-include zone snippet and
+			// leave a one-time setup note (the response-policy line must live inside
+			// named.conf's options{}, which cannot be supplied from an include).
+			writefile(dns_output.config,
+				'zone "rpz.' + pkg.name + '" {\n' +
+				'\ttype master;\n' +
+				'\tfile "' + dns_output.file + '";\n' +
+				'\tallow-query { none; };\n' +
+				'\tcheck-names ignore;\n' +
+				'};\n');
+			chmod(dns_output.file, 0644);
+			chmod(dns_output.config, 0644);
+			chown(dns_output.file, 'root', 'root');
+			chown(dns_output.config, 'root', 'root');
+			// Only nag about the one-time named.conf wiring when it isn't already
+			// in place — otherwise a correctly-configured BIND would warn on every
+			// single update.
+			if (!_bind_rpz_configured())
+				push(status_data.warnings, { code: 'warningBindManualConfig', info: dns_output.config });
 			break;
 		}
 		output.ok();
@@ -1554,105 +1819,129 @@ function resolver(action) {
 
 // ── process_file_url ────────────────────────────────────────────────
 
-function process_file_url(section, url_override, action_override, predownloaded) {
-	let url, file_action, name, size_val;
+// prepare_file_url(): parallelizable half — resolve config, download into
+// out_file, detect format, filter in place. Returns a result object with
+// everything callers need; no printing, no shared state — safe in a
+// uloop.task child. The [ DL ] line is emitted by emit_dl_line() (below),
+// called by both serial callers and the parallel uloop.task callback so
+// the line shows in the parent's visible stderr.
+function prepare_file_url(section, url_override, action_override, out_file) {
+	let url, file_action, name;
+	let res = { section: section, url: null, name: null, action: 'block',
+		out_file: out_file, size: null, format: null, ok: false, code: null, skip: false };
 
 	if (section && !url_override) {
 		let sec_cur = cursor();
 		sec_cur.load(pkg.name);
-		let en = sec_cur.get(pkg.name, section, 'enabled');
-		if (en == '0') return true;
+		if (sec_cur.get(pkg.name, section, 'enabled') == '0') { res.ok = true; res.skip = true; return res; }
 		url = sec_cur.get(pkg.name, section, 'url');
 		file_action = sec_cur.get(pkg.name, section, 'action') || 'block';
 		name = sec_cur.get(pkg.name, section, 'name');
-		size_val = sec_cur.get(pkg.name, section, 'size');
 	} else {
 		url = url_override;
 		file_action = action_override || 'block';
 	}
+	res.url = url; res.name = name; res.action = file_action;
 
-	if (!cfg.enabled) return true;
-	if (!url) return false;
+	if (!cfg.enabled) { res.ok = true; res.skip = true; return res; }
+	if (!url) { res.skip = true; return res; }
 
-	let label = replace(url, /^[a-z]+:\/\//, '');
-	label = replace(label, /\/.*$/, '');
-	label = name || label;
+	if (is_https_url(url) && !env.get_downloader().ssl_supported) {
+		res.code = 'errorNoSSLSupport';
+		return res;
+	}
+
+	if (!download(url, out_file) || !(stat(out_file)?.size > 0)) {
+		res.code = 'errorDownloadingList';
+		res.timed_out = env._last_dl_timeout;
+		return res;
+	}
+
+	ensure_trailing_newline(out_file);
+	res.size = get_local_filesize(out_file);
+
+	let format = detect_file_type(out_file);
+	let filter = list_formats[format]?.filter;
+	if (!filter) {
+		res.code = 'errorDetectingFileType';
+		return res;
+	}
+	res.format = format;
+	if (format == 'hosts')
+		sed_inplace('/# Title: StevenBlack/,/# Custom host records are listed here/d', out_file);
+	if (filter && file_action != 'file')
+		sed_inplace(filter, out_file);
+
+	if (!(stat(out_file)?.size > 0)) {
+		res.code = 'errorParsingList';
+		return res;
+	}
+
+	ensure_trailing_newline(out_file);
+	res.ok = true;
+	return res;
+}
+
+// emit_dl_line(): print the live [ DL ] outcome line for one result.
+// Called from serial callers AND from the parallel download_lists
+// callback as each task reports. Output goes to the PARENT'S stderr (and
+// syslog) so it's visible in the install terminal — uloop.task does not
+// propagate the child's stderr, which is why prepare_file_url is silent.
+function emit_dl_line(res) {
+	if (!res || res.skip) return;
+	let type_name = (res.action == 'allow') ? 'Allowed' :
+	                (res.action == 'file')  ? 'File'    : 'Blocked';
+	let url = res.url || '';
+	let label = res.name;
+	if (!label) {
+		label = replace(url, /^[a-z]+:\/\//, '');
+		label = replace(label, /\/.*$/, '');
+	}
 	label = 'List: ' + label;
+	let outcome = res.ok ? sym.ok : sym.fail;
+	let fmtsuffix = (res.ok && res.format) ? ' (' + res.format + ')' : '';
+	output.info(outcome[0]);
+	output.verbose('[ DL ] ' + type_name + ' ' + label + fmtsuffix + ' ' + outcome[1] + '\\n');
+}
 
-	let type_name, d_tmp;
-	switch (file_action) {
-	case 'allow': type_name = 'Allowed'; d_tmp = tmp.allowed; break;
-	case 'block': type_name = 'Blocked'; d_tmp = tmp.b; break;
-	case 'file': type_name = 'File'; d_tmp = tmp.b; break;
+// apply_result(): serial half — append to accumulator, record errors,
+// stage the size update. Parent-side only; never call from a task child.
+function apply_result(res) {
+	if (!res || res.skip) return;
+	if (res.code) {
+		push(status_data.errors, { code: res.code, info: res.name || res.url });
+		if (res.timed_out)
+			push(status_data.warnings, { code: 'warningDownloadTimeout', info: res.name || res.url });
+		return;
 	}
-
-	if (!predownloaded && is_https_url(url) && !env.get_downloader().ssl_supported) {
-		output.info(sym.fail[0]);
-		output.verbose('[ DL ] ' + type_name + ' ' + label + ' ' + sym.fail[1] + '\\n');
-		push(status_data.errors, { code: 'errorNoSSLSupport', info: name || url });
-		return true;
-	}
-
-	let r_tmp = predownloaded || trim(cmd_output('mktemp -q -t "' + pkg.name + '_tmp.XXXXXXXX"'));
-	if (predownloaded && !(stat(r_tmp)?.size > 0)) {
-		output.info(sym.fail[0]);
-		output.verbose('[ DL ] ' + type_name + ' ' + label + ' ' + sym.fail[1] + '\\n');
-		push(status_data.errors, { code: 'errorDownloadingList', info: name || url });
-		unlink(r_tmp);
-		return true;
-	}
-	if (!predownloaded && (!url || !download(url, r_tmp) || !(stat(r_tmp)?.size > 0))) {
-		output.info(sym.fail[0]);
-		output.verbose('[ DL ] ' + type_name + ' ' + label + ' ' + sym.fail[1] + '\\n');
-		push(status_data.errors, { code: 'errorDownloadingList', info: name || url });
-	} else {
-		// Ensure newline at end
-		ensure_trailing_newline(r_tmp);
-
-		// Update size in config if changed
-		if (section) {
-			let new_size = get_local_filesize(r_tmp);
-			if (new_size != null && ('' + size_val) != ('' + new_size))
-				uci(pkg.name).set(pkg.name, section, 'size', '' + new_size);
-			uci(pkg.name).save(pkg.name);
-		}
-
-		let format = detect_file_type(r_tmp);
-		let filter = list_formats[format]?.filter;
-		if (!filter) {
-			output.info(sym.fail[0]);
-			output.verbose('[ DL ] ' + type_name + ' ' + label + ' ' + sym.fail[1] + '\\n');
-			push(status_data.errors, { code: 'errorDetectingFileType', info: name || url });
-			unlink(r_tmp);
-			return true;
-		}
-		if (format == 'hosts')
-			sed_inplace('/# Title: StevenBlack/,/# Custom host records are listed here/d', r_tmp);
-
-		if (filter && file_action != 'file')
-			sed_inplace(filter, r_tmp);
-
-		if (!(stat(r_tmp)?.size > 0)) {
-			output.info(sym.fail[0]);
-			output.verbose('[ DL ] ' + type_name + ' ' + label + ' (' + format + ') ' + sym.fail[1] + '\\n');
-			push(status_data.errors, { code: 'errorParsingList', info: name || url });
-		} else {
-			// Ensure file ends with newline, then append to accumulator
-			ensure_trailing_newline(r_tmp);
-			let inp = open(r_tmp, 'r');
-			let out = open(d_tmp, 'a');
-			if (inp && out) {
-				let chunk;
-				while ((chunk = inp.read(65536)) && length(chunk))
-					out.write(chunk);
-			}
-			if (inp) inp.close();
-			if (out) out.close();
-			output.info(sym.ok[0]);
-			output.verbose('[ DL ] ' + type_name + ' ' + label + ' (' + format + ') ' + sym.ok[1] + '\\n');
+	if (!res.ok) return;
+	if (res.section && res.size != null) {
+		let c = cfg.update_config_sizes ? uci(pkg.name) : ram_uci(pkg.name);
+		if (('' + c.get(pkg.name, res.section, 'size')) != ('' + res.size)) {
+			c.set(pkg.name, res.section, 'size', '' + res.size);
+			c.save(pkg.name);
 		}
 	}
-	unlink(r_tmp);
+	let d_tmp = (res.action == 'allow') ? tmp.allowed : tmp.b;
+	let inp = open(res.out_file, 'r');
+	let out = open(d_tmp, 'a');
+	if (inp && out) {
+		let chunk;
+		while ((chunk = inp.read(65536)) && length(chunk))
+			out.write(chunk);
+	}
+	if (inp) inp.close();
+	if (out) out.close();
+}
+
+// process_file_url(): thin wrapper for serial callers (dnsmasq file,
+// non-parallel mode). Kept exported — also the test-runner's anchor.
+function process_file_url(section, url_override, action_override) {
+	let out_file = trim(cmd_output('mktemp -q -t "' + pkg.name + '_tmp.XXXXXXXX"'));
+	let res = prepare_file_url(section, url_override, action_override, out_file);
+	emit_dl_line(res);
+	apply_result(res);
+	unlink(out_file);
 	return true;
 }
 
@@ -1683,24 +1972,45 @@ function download_dnsmasq_file() {
 // ── download_lists ──────────────────────────────────────────────────
 
 function download_lists() {
-	// RAM check
 	let free_mem = get_mem_available();
-	if (!free_mem) {
-		push(status_data.warnings, { code: 'warningFreeRamCheckFail', info: '' });
-		output.warning(get_text('warningFreeRamCheckFail'));
-	} else {
-		let total_sizes = 0;
-		uci(pkg.name).foreach(pkg.name, 'file_url', (s) => {
-			if (s.enabled == '0') return;
-			let sz = s.size;
-			if (!sz && s.url) sz = get_url_filesize(s.url);
-			if (sz) total_sizes += int('' + sz);
-		});
-		if (free_mem < total_sizes * 2) {
+
+	// Enumerate enabled lists and sum their sizes in one pass.
+	let download_cfgs = [];
+	let total_sizes = 0;
+	let szc = cfg.update_config_sizes ? uci(pkg.name) : ram_uci(pkg.name);
+	uci(pkg.name).foreach(pkg.name, 'file_url', (s) => {
+		if (s.enabled == '0') return;
+		push(download_cfgs, s['.name']);
+		let sz = szc.get(pkg.name, s['.name'], 'size');
+		if (!sz && s.url) sz = get_url_filesize(s.url);
+		if (sz) total_sizes += int('' + sz);
+	});
+	let n_lists = length(download_cfgs);
+
+	// RAM budget: list data needs ~total_sizes*2; each parallel task slot
+	// needs the ucode child + its downloader (task_slot_ram, keyed by kind).
+	// Effective cap = min(configured parallel_downloads, list count, what
+	// free RAM affords) — so a tight router throttles itself down.
+	let base = total_sizes * 2;
+	let dlt = env.get_downloader();
+	let slot_ram = pkg.task_slot_ram[dlt.kind] || pkg.task_slot_ram['default'];
+	let task_cap = +cfg.parallel_downloads;
+	if (free_mem) {
+		if (free_mem < base + slot_ram) {
 			push(status_data.errors, { code: 'errorTooLittleRam', info: '' + free_mem });
 			return false;
 		}
+		let affordable = int((free_mem - base) / slot_ram);
+		if (task_cap > affordable) {
+			task_cap = affordable;
+			push(status_data.warnings, { code: 'warningParallelDownloadsThrottled', info: '' + task_cap });
+		}
+	} else {
+		push(status_data.warnings, { code: 'warningFreeRamCheckFail', info: '' });
+		output.warning(get_text('warningFreeRamCheckFail'));
 	}
+	if (task_cap > n_lists) task_cap = n_lists;
+	if (task_cap < 1) task_cap = 1;
 
 	status_data.message = get_text('statusDownloading') + '...';
 	status_data.status = 'statusDownloading';
@@ -1714,52 +2024,88 @@ function download_lists() {
 
 	output.info('Downloading lists ');
 
-	// Process each file_url section
-	let download_cfgs = [];
-	uci(pkg.name).foreach(pkg.name, 'file_url', (s) => push(download_cfgs, s['.name']));
-
-	if (cfg.parallel_downloads && uloop && length(download_cfgs) > 1) {
-		// Parallel mode: download all files first, then process each
-		let dlt = env.get_downloader();
-		let jobs = [];
+	if (cfg.parallel_downloads && uloop && task_cap > 1 && n_lists > 1) {
+		// Parallel: a bounded uloop.task pool, <= task_cap tasks in flight.
+		// Each task forks; the child runs prepare_file_url (download + detect
+		// + filter) and pipe.sends the result; the parent applies serially
+		// after the loop. popen/system are safe inside the child — it is not
+		// running the event loop.
+		if (cfg.debug_performance)
+			logger_debug(sprintf('[PERF] download_lists: %d lists, cap %d, downloader %s (~%d KB/slot), MemAvailable %d KB',
+				n_lists, task_cap, dlt.kind, slot_ram / 1024, (free_mem || 0) / 1024));
+		uloop.init();
+		let next = 0, running = 0, results = {}, tmps = [];
+		let spawn;
+		spawn = function() {
+			while (running < task_cap && next < n_lists) {
+				let cfg_name = download_cfgs[next++];
+				let out_file = trim(cmd_output('mktemp -q -t "' + pkg.name + '_tmp.XXXXXXXX"'));
+				push(tmps, out_file);
+				running++;
+				let t = uloop.task(
+					function(pipe) {
+						let res = prepare_file_url(cfg_name, null, null, out_file);
+						if (cfg.debug_performance) {
+							let m = match(readfile('/proc/self/status') || '', /VmHWM:[ \t]+([0-9]+)/);
+							res.peak_rss = m ? int(m[1]) : 0;
+						}
+						pipe.send(res);
+					},
+					function(res) {
+						// uloop.task may fire this callback twice per child
+						// (data send + child-exit EOF). Count completed sections,
+						// not callback firings, so null/duplicate fires are no-ops.
+						if (!res || !res.section || results[res.section]) return;
+						results[res.section] = res;
+						running--;
+						emit_dl_line(res);
+						if (cfg.debug_performance)
+							logger_debug(sprintf('[PERF] task %s: peak RSS %d KB, list size %d KB',
+								res.name || res.url || '?', +(res.peak_rss || 0), int((res.size || 0) / 1024)));
+						if (length(keys(results)) >= n_lists) uloop.end();
+						else spawn();
+					}
+				);
+				if (t == null) {
+					// Fork failed — no callback will ever fire for this section;
+					// record a sentinel so the completion gate accounts for it.
+					results[cfg_name] = false;
+					running--;
+					if (length(keys(results)) >= n_lists) uloop.end();
+				}
+			}
+		};
+		spawn();
+		// Watchdog: never hang if a task child dies without reporting.
+		uloop.timer(600000, function() { uloop.end(); });
+		uloop.run();
+		uloop.done();
 		for (let cfg_name in download_cfgs) {
-			let sec_cur = cursor();
-			sec_cur.load(pkg.name);
-			if (sec_cur.get(pkg.name, cfg_name, 'enabled') == '0') continue;
-			let url = sec_cur.get(pkg.name, cfg_name, 'url');
-			if (!url) continue;
-			if (is_https_url(url) && !dlt.ssl_supported) {
-				let name = sec_cur.get(pkg.name, cfg_name, 'name');
-				push(status_data.errors, { code: 'errorNoSSLSupport', info: name || url });
-				output.info(sym.fail[0]);
-				continue;
+			let res = results[cfg_name];
+			if (res) {
+				apply_result(res);
+			} else {
+				// Task didn't report (crash/timeout/spawn fail) — surface a
+				// user-friendly label, not the anonymous UCI section name.
+				let sec_cur = cursor();
+				sec_cur.load(pkg.name);
+				let label = sec_cur.get(pkg.name, cfg_name, 'name') ||
+					sec_cur.get(pkg.name, cfg_name, 'url') || cfg_name;
+				push(status_data.errors, { code: 'errorDownloadingList', info: label });
 			}
-			let r_tmp = trim(cmd_output('mktemp -q -t "' + pkg.name + '_tmp.XXXXXXXX"'));
-			push(jobs, { cfg_name, url, r_tmp });
 		}
-		if (length(jobs) > 0) {
-			uloop.init();
-			let pending = length(jobs);
-			for (let job in jobs) {
-				let dl_cmd = sprintf('%s %s %s %s 2>/dev/null',
-					dlt.command, shell_quote(job.url), dlt.flag, shell_quote(job.r_tmp));
-				uloop.process('/bin/sh', ['-c', dl_cmd], {}, () => {
-					if (--pending == 0) uloop.end();
-				});
-			}
-			uloop.run();
-			uloop.done();
-			for (let job in jobs)
-				process_file_url(job.cfg_name, null, null, job.r_tmp);
-		}
+		for (let f in tmps) unlink(f);
 	} else {
 		for (let cfg_name in download_cfgs)
 			process_file_url(cfg_name);
 	}
 
-	if (uci_has_changes(pkg.name)) {
-		output.verbose('[PROC] Saving updated file sizes ');
-		if (cfg.update_config_sizes && uci(pkg.name).commit(pkg.name))
+	let c = cfg.update_config_sizes ? uci(pkg.name) : ram_uci(pkg.name);
+	if (length(c.changes(pkg.name) || [])) {
+		output.verbose(cfg.update_config_sizes
+			? '[PROC] Saving updated file sizes '
+			: '[PROC] Saving updated file sizes to RAM ');
+		if (c.commit(pkg.name))
 			output.ok();
 		else
 			output.fail();
@@ -1811,10 +2157,22 @@ function download_lists() {
 	elapsed = end_time - start_time;
 	logger_debug('[PERF-DEBUG] ' + step_title + ' took ' + elapsed + 's');
 
-	// Optimization (subdomain dedup)
-	let needs_optimization = (cfg.dns == 'dnsmasq.conf' || cfg.dns == 'dnsmasq.ipset' || cfg.dns == 'dnsmasq.nftset' ||
-		cfg.dns == 'dnsmasq.servers' || cfg.dns == 'smartdns.domainset' || cfg.dns == 'smartdns.ipset' ||
-		cfg.dns == 'smartdns.nftset' || cfg.dns == 'unbound.adb_list');
+	// Optimization (subdomain dedup) — every mode except dnsmasq.addnhosts, whose
+	// hosts-file format cannot express a wildcard so subdomains must be listed.
+	let needs_optimization = false;
+	switch (cfg.dns) {
+	case 'dnsmasq.conf':
+	case 'dnsmasq.ipset':
+	case 'dnsmasq.nftset':
+	case 'dnsmasq.servers':
+	case 'smartdns.domainset':
+	case 'smartdns.ipset':
+	case 'smartdns.nftset':
+	case 'unbound.adb_list':
+	case 'bind.rpz':
+		needs_optimization = true;
+		break;
+	}
 
 	if (needs_optimization) {
 		start_time = time();
@@ -1942,11 +2300,29 @@ function download_lists() {
 		output.fail();
 		push(status_data.errors, { code: 'errorMovingDataFile', info: dns_output.file });
 	}
-	if (cfg.dns == 'unbound.adb_list')
+	// Prepend the resolver's file header, if any.
+	switch (cfg.dns) {
+	case 'unbound.adb_list':
 		sed_inplace('1 i\\server:', dns_output.file);
+		break;
+	case 'bind.rpz':
+		// Prepend the RPZ zone header. The SOA serial must advance on every write
+		// or BIND refuses to reload the zone — time() (epoch seconds) is naturally
+		// monotonic. Streamed via a temp file so a multi-million-line zone is never
+		// pulled into memory.
+		let serial = sprintf('%d', time());
+		let header = '$TTL 2h\n' +
+			'@ IN SOA localhost. root.localhost. ( ' + serial + ' 6h 1h 1w 2h )\n' +
+			'  IN NS localhost.\n';
+		writefile(tmp.a, header);
+		system(sprintf('cat %s %s > %s && mv %s %s',
+			shell_quote(tmp.a), shell_quote(dns_output.file),
+			shell_quote(tmp.b), shell_quote(tmp.b), shell_quote(dns_output.file)));
+		break;
+	}
 
 	// Validity check
-	if (cfg.dnsmasq_validity_check && index(cfg.dns, 'dnsmasq.') == 0) {
+	if (cfg.dnsmasq_validity_check && is_dnsmasq_mode()) {
 		start_time = time();
 		step_title = 'Validating domain entries';
 		output.verbose('[PROC] ' + step_title + ' ');
@@ -2017,6 +2393,8 @@ function adb_config_update(param) {
 	if (!download(cfg.config_update_url, r_tmp) || !(stat(r_tmp)?.size > 0)) {
 		output.failn();
 		push(status_data.errors, { code: 'errorDownloadingConfigUpdate', info: '' });
+		if (env._last_dl_timeout)
+			push(status_data.warnings, { code: 'warningDownloadTimeout', info: 'Config Update file' });
 	} else {
 		if (system(sprintf("sed -f %s -i %s 2>/dev/null", shell_quote(r_tmp), shell_quote(pkg.config_file))) == 0)
 			output.okn();
@@ -2061,8 +2439,8 @@ function _build_procd_data() {
 	result.outputFile = dns_output.file;
 	result.outputCache = dns_output.cache;
 
-	let gzip_path = cfg.compressed_cache_dir
-		? cfg.compressed_cache_dir + '/' + dns_output.gzip
+	let gzip_path = cfg.compressed_cache
+		? dns_output.gzip
 		: '';
 	result.outputGzip = gzip_path;
 
@@ -2085,6 +2463,7 @@ function _build_procd_data() {
 		smartdns_ipset_support: env.smartdns_installed && env.ipset_supported,
 		smartdns_nftset_support: env.smartdns_installed && env.nft_installed,
 		unbound_installed: env.unbound_installed,
+		bind_installed: env.bind_installed,
 		leds: lsdir('/sys/class/leds') || [],
 	};
 
@@ -2206,6 +2585,7 @@ function emit_procd_shell(data) {
 	push(lines, 'json_add_boolean smartdns_ipset_support ' + shell_quote(plat.smartdns_ipset_support ? '1' : '0'));
 	push(lines, 'json_add_boolean smartdns_nftset_support ' + shell_quote(plat.smartdns_nftset_support ? '1' : '0'));
 	push(lines, 'json_add_boolean unbound_installed ' + shell_quote(plat.unbound_installed ? '1' : '0'));
+	push(lines, 'json_add_boolean bind_installed ' + shell_quote(plat.bind_installed ? '1' : '0'));
 	push(lines, 'json_add_array leds');
 	for (let led in (plat.leds || []))
 		push(lines, 'json_add_string \'\' ' + shell_quote('' + led));
@@ -2510,7 +2890,7 @@ function allow(string) {
 		return;
 	}
 
-	let resolver_name = split(cfg.dns, '.')[0];
+	let resolver_name = resolver_service_name();
 	output.info('Allowing domains and restarting ' + resolver_name + ' ');
 	output.verbose('[PROC] Allowing domains \\n');
 
@@ -2518,13 +2898,36 @@ function allow(string) {
 		if (!c) continue;
 		output.verbose('  ' + c + ' ');
 		let escaped = replace(c, /\./g, '\\.');
-		switch (split(cfg.dns, '.')[0]) {
-		case 'dnsmasq':
-			sed_inplace(sprintf('\\:/\\(/%s\\|.%s\\):d', escaped, escaped), dns_output.file);
+		// Allowing a domain removes the block for that exact name AND every
+		// subdomain of it (a left boundary of start-of-field or a literal '.'),
+		// while leaving unrelated names that merely share the suffix as a
+		// substring (myDOMAIN, DOMAIN.evil.com) untouched. Each mode's on-disk
+		// format needs its own boundary anchors.
+		switch (cfg.dns) {
+		case 'dnsmasq.addnhosts':
+		case 'dnsmasq.conf':
+		case 'dnsmasq.ipset':
+		case 'dnsmasq.nftset':
+		case 'dnsmasq.servers':
+			// Domain sits between '/' (or a space, for addnhosts) and '/' (or
+			// end-of-line): server=/d/, local=/d/, ipset=/d/adb, '127.0.0.1 d'.
+			sed_inplace(sprintf('\\:[/. ]%s\\(/\\|$\\):d', escaped), dns_output.file);
 			break;
-		case 'smartdns':
-		case 'unbound':
-			sed_inplace(sprintf('\\:\\("%s\\|.%s"\\):d', escaped, escaped), dns_output.file);
+		case 'smartdns.domainset':
+		case 'smartdns.ipset':
+		case 'smartdns.nftset':
+			// Bare domain, one per line.
+			sed_inplace(sprintf('/\\(^\\|\\.\\)%s$/d', escaped), dns_output.file);
+			break;
+		case 'unbound.adb_list':
+			// local-zone: "d." always_nxdomain — domain between '"' and the
+			// trailing '."'.
+			sed_inplace(sprintf('\\:[."]%s\\.":d', escaped), dns_output.file);
+			break;
+		case 'bind.rpz':
+			// Drop the apex/wildcard RPZ records for the domain and any subdomain
+			// of it: '[*.]d CNAME .', '[*.]sub.d CNAME .'.
+			sed_inplace(sprintf('/^\\(.*\\.\\)\\{0,1\\}%s CNAME \\.$/d', escaped), dns_output.file);
 			break;
 		}
 		output.ok();
@@ -2547,14 +2950,16 @@ function allow(string) {
 		adb_config_cache('create');
 		status_data.stats = pkg.service_name + ' is blocking ' + count_blocked_domains() + ' domains (with ' + cfg.dns + ')';
 		output.ok();
-		if (cfg.dns == 'dnsmasq.ipset') {
+		switch (cfg.dns) {
+		case 'dnsmasq.ipset':
 			output.verbose('[PROC] Flushing adb ipset ');
 			if (system('ipset -q -! flush adb 2>/dev/null') == 0) output.ok(); else output.fail();
-		}
-		if (cfg.dns == 'dnsmasq.nftset') {
+			break;
+		case 'dnsmasq.nftset':
 			output.verbose('[PROC] Flushing adb nft sets ');
 			system('nft flush set inet fw4 adb6 2>/dev/null');
 			if (system('nft flush set inet fw4 adb4 2>/dev/null') == 0) output.ok(); else output.fail();
+			break;
 		}
 		output.dns('Restarting ' + resolver_name + ' ');
 		if (service_restart(resolver_name)) output.ok(); else output.fail();
@@ -2575,17 +2980,26 @@ function check(param) {
 		output.print("Usage: /etc/init.d/" + pkg.name + " check 'domain' ...\\n");
 		return;
 	}
+	// Restrict matching to genuine block entries. Some modes keep non-block
+	// lines in the same file — dnsmasq.servers writes explicit allows as
+	// 'server=/domain/#', and bind.rpz emits a '*.domain' wildcard alongside
+	// each apex record — and neither should be reported as a block. The mode's
+	// blocked_count_filter (a sed expression) already isolates block lines, so
+	// pre-filter the file through it before grepping.
+	let blocks = dns_output.blocked_count_filter
+		? sprintf("sed '%s' %s", dns_output.blocked_count_filter, shell_quote(dns_output.file))
+		: sprintf('cat %s', shell_quote(dns_output.file));
 	for (let string in split('' + param, /\s+/)) {
 		if (!string) continue;
-		let c = grep_count(string, dns_output.file, '-c -E');
+		let c = int(trim(cmd_output(sprintf('%s | grep -c -E %s', blocks, shell_quote(string)))) || '0');
 		if (c > 0) {
 			let word = (c == 1) ? '1 match' : c + ' matches';
 			output.info("Found " + word + " for '" + string + "' in '" + dns_output.file + "'.\\n");
 			output.verbose("[PROC] Found " + word + " for '" + string + "' in '" + dns_output.file + "'.\\n");
 			if (c <= 20) {
-				let matches = grep_output(string, dns_output.file);
+				let matches = cmd_output(sprintf('%s | grep -E %s', blocks, shell_quote(string)));
 				if (dns_output.parse_filter)
-					matches = cmd_output(sprintf("grep %s %s | sed '%s'", shell_quote(string), shell_quote(dns_output.file), dns_output.parse_filter));
+					matches = cmd_output(sprintf("%s | grep -E %s | sed '%s'", blocks, shell_quote(string), dns_output.parse_filter));
 				if (matches) output.print(matches + '\\n');
 			}
 		} else {
@@ -2601,15 +3015,15 @@ function check_tld() {
 		output.print("No block-list ('" + dns_output.file + "') found.\\n");
 		return;
 	}
-	let c = grep_count('\\.|server:', dns_output.file, '-cvE');
+	let c = grep_count(tld_ok_pattern(), dns_output.file, '-cvE');
 	if (c > 0) {
 		let word = (c == 1) ? '1 match for TLD' : c + ' matches for TLDs';
 		output.info("Found " + word + " in '" + dns_output.file + "'.\\n");
 		output.verbose("[PROC] Found " + word + " in '" + dns_output.file + "'.\\n");
 		if (c <= 20) {
-			let matches = grep_output('\\.|server:', dns_output.file, '-vE');
+			let matches = grep_output(tld_ok_pattern(), dns_output.file, '-vE');
 			if (dns_output.parse_filter)
-				matches = cmd_output(sprintf("grep -vE '\\.|server:' %s | sed '%s'", shell_quote(dns_output.file), dns_output.parse_filter));
+				matches = cmd_output(sprintf("grep -vE %s %s | sed '%s'", shell_quote(tld_ok_pattern()), shell_quote(dns_output.file), dns_output.parse_filter));
 			if (matches) output.print(matches + '\\n');
 		}
 	} else {
@@ -2625,10 +3039,17 @@ function check_leading_dot() {
 		return;
 	}
 	let search_string = '';
-	switch (split(cfg.dns, '.')[0]) {
-	case 'dnsmasq': search_string = '/\\.'; break;
-	case 'smartdns': search_string = '^\\.'; break;
-	case 'unbound': search_string = '"\\.'; break;
+	switch (cfg.dns) {
+	case 'dnsmasq.addnhosts':
+	case 'dnsmasq.conf':
+	case 'dnsmasq.ipset':
+	case 'dnsmasq.nftset':
+	case 'dnsmasq.servers': search_string = '/\\.'; break;
+	case 'smartdns.domainset':
+	case 'smartdns.ipset':
+	case 'smartdns.nftset': search_string = '^\\.'; break;
+	case 'unbound.adb_list': search_string = '"\\.'; break;
+	case 'bind.rpz': search_string = '^\\.'; break;
 	default: return;
 	}
 	let c = grep_count(search_string, dns_output.file);
@@ -2734,19 +3155,19 @@ function show_blocklist() {
 
 function sizes() {
 	env.load_config();
+	let c = cfg.update_config_sizes ? uci(pkg.name) : ram_uci(pkg.name);
 	uci(pkg.name).foreach(pkg.name, 'file_url', (s) => {
 		let size = get_url_filesize(s.url);
 		output.print((s.name || s.url) + (size ? ': ' + size : '') + ' ');
 		if (size) {
-			uci(pkg.name).set(pkg.name, s['.name'], 'size', '' + size);
+			c.set(pkg.name, s['.name'], 'size', '' + size);
 			output.okn();
 		} else {
 			output.failn();
 		}
 	});
-	uci(pkg.name).save(pkg.name);
-	if (cfg.update_config_sizes && length(uci(pkg.name).changes(pkg.name) || []))
-		uci(pkg.name).commit(pkg.name);
+	c.save(pkg.name);
+	c.commit(pkg.name);
 }
 
 // ── get_network_trigger_info (for service_triggers) ─────────────────
@@ -2772,8 +3193,8 @@ function get_init_status(name) {
 
 	// Gzip path (for live file-existence checks)
 	let gzip_path = svc_data?.outputGzip || '';
-	if (!gzip_path && cfg.compressed_cache_dir)
-		gzip_path = cfg.compressed_cache_dir + '/' + dns_output.gzip;
+	if (!gzip_path && cfg.compressed_cache)
+		gzip_path = dns_output.gzip;
 
 	let result = {};
 	result[name] = {
@@ -2813,6 +3234,7 @@ function get_init_status(name) {
 			smartdns_ipset_support: env.smartdns_installed && env.ipset_supported,
 			smartdns_nftset_support: env.smartdns_installed && env.nft_installed,
 			unbound_installed: env.unbound_installed,
+			bind_installed: env.bind_installed,
 			leds: lsdir('/sys/class/leds') || [],
 		},
 
@@ -2844,6 +3266,7 @@ function get_platform_support(name) {
 		smartdns_ipset_support: env.smartdns_installed && env.ipset_supported,
 		smartdns_nftset_support: env.smartdns_installed && env.nft_installed,
 		unbound_installed: env.unbound_installed,
+		bind_installed: env.bind_installed,
 		leds: length(lsdir('/sys/class/leds') || []) > 0,
 	};
 	return result;
@@ -2854,9 +3277,17 @@ function get_file_url_filesizes(name) {
 	env.load_config();
 
 	let files = [];
+	let c = cfg.update_config_sizes ? uci(pkg.name) : ram_uci(pkg.name);
 	uci(pkg.name).foreach(pkg.name, 'file_url', (s) => {
-		let size = s.size;
-		if (!size && s.url) size = get_url_filesize(s.url);
+		let size = c.get(pkg.name, s['.name'], 'size');
+		if (!size && s.url) {
+			size = get_url_filesize(s.url);
+			if (size) {
+				c.set(pkg.name, s['.name'], 'size', '' + size);
+				c.save(pkg.name);
+				c.commit(pkg.name);
+			}
+		}
 		push(files, { name: s.name || s.url, url: s.url, size: size || '' });
 	});
 
@@ -2910,4 +3341,3 @@ export default {
 	emit_procd_shell,
 	process_file_url,
 };
-
