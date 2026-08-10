@@ -1,4 +1,6 @@
 #
+# Copyright (C) 2007-2016 OpenWrt.org
+#
 # This is free software, licensed under the GNU General Public License v2.
 # See /LICENSE for more information.
 #
@@ -6,15 +8,15 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=avahi
-PKG_VERSION:=0.8
-PKG_RELEASE:=10
+PKG_VERSION:=0.9_rc5
+PKG_RELEASE:=1
 
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://github.com/avahi/avahi/releases/download/v$(PKG_VERSION) \
-		https://avahi.org/download
-PKG_HASH:=060309d7a333d38d951bc27598c677af1796934dbd98e1024e7ad8de798fedda
+PKG_SOURCE:=$(PKG_NAME)-0.9-rc5.tar.gz
+PKG_SOURCE_URL:=https://codeload.github.com/avahi/avahi/tar.gz/v0.9-rc5?
+PKG_HASH:=5b0a9d88110b0fc8aaafc5cc0a26e83e7d2a4aca3a36bc27c9b626db7ead27b0
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(BUILD_VARIANT)/$(PKG_NAME)-0.9-rc5
 
-PKG_MAINTAINER:=
+PKG_MAINTAINER:=Ted Hess <thess@kitschensync.net>
 PKG_LICENSE:=LGPL-2.1-or-later
 PKG_LICENSE_FILES:=LICENSE
 PKG_CPE_ID:=cpe:/a:avahi:avahi
@@ -65,7 +67,6 @@ define Package/avahi-autoipd
   SUBMENU:=IP Addresses and Names
   DEPENDS:=+libdaemon
   TITLE:=IPv4LL network address configuration daemon
-  USERID:=avahi=105:avahi=105
 endef
 
 define Package/avahi-autoipd/description
@@ -85,7 +86,6 @@ define Package/avahi-dbus-daemon
   SUBMENU:=IP Addresses and Names
   DEPENDS:=+libavahi-dbus-support +libexpat +librt +libdaemon
   TITLE+= (daemon)
-  USERID:=avahi=105:avahi=105
 endef
 
 define Package/avahi-nodbus-daemon
@@ -153,7 +153,6 @@ define Package/avahi-dnsconfd
   SUBMENU:=IP Addresses and Names
   DEPENDS:=+libavahi +libdaemon +libpthread
   TITLE:=A Unicast DNS server using avahi-daemon
-  USERID:=avahi=105:avahi=105
 endef
 
 define Package/avahi-dnsconfd/description
@@ -269,13 +268,15 @@ CONFIGURE_ARGS += \
 	--disable-manpages \
 	--disable-xmltoman \
 	--disable-tests \
+	--disable-libsystemd \
+	--with-systemdsystemunitdir=no \
 	--with-xml=expat \
 	--with-distro=none \
-	--with-avahi-user=avahi \
-	--with-avahi-group=avahi \
-	--with-avahi-priv-access-group=avahi \
-	--with-autoipd-user=avahi \
-	--with-autoipd-group=avahi
+	--with-avahi-user=nobody \
+	--with-avahi-group=nogroup \
+	--with-avahi-priv-access-group=nogroup \
+	--with-autoipd-user=nobody \
+	--with-autoipd-group=nogroup
 
 ifeq ($(BUILD_VARIANT),dbus)
 CONFIGURE_ARGS += \
@@ -306,7 +307,7 @@ endef
 define Package/libavahi-dbus-support/install
 	$(call Package/libavahi/install,$(1))
 	$(INSTALL_DIR) $(1)/etc/dbus-1/system.d
-	$(INSTALL_DATA) $(PKG_INSTALL_DIR)/etc/dbus-1/system.d/* $(1)/etc/dbus-1/system.d
+	$(INSTALL_DATA) $(PKG_INSTALL_DIR)/usr/share/dbus-1/system.d/* $(1)/etc/dbus-1/system.d
 endef
 
 Package/libavahi-nodbus-support/install=$(Package/libavahi/install)
