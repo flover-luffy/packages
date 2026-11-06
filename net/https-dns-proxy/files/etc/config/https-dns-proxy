@@ -4,7 +4,7 @@ config main 'config'
 # Answer Mozilla canary domain so Firefox does not auto-enable its own DoH
 	option canary_domains_mozilla '1'
 # dnsmasq instances to point at the proxy ('*' = all, or space-separated indexes/names)
-	option dnsmasq_config_update '-'
+	option dnsmasq_config_update '*'
 # Force LAN clients onto the proxy by redirecting/rejecting their outbound DNS
 	option force_dns '1'
 # Add nftables notrack rules for the proxy's loopback DNS traffic
